@@ -1,359 +1,577 @@
+// Dans app/booking/index.tsx - CORRECTION de la boucle infinie
 
-// Dans app/booking/confirm.tsx
-// VERSION CORRIGÉE : Ajout de l'insertion dans conversation_participants
-
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
-    View, Text, StyleSheet, TouchableOpacity, ScrollView, Image,
-    Platform, ActivityIndicator, Alert, SafeAreaView
+    View, Text, StyleSheet, ScrollView, TouchableOpacity, Platform,
+    ActivityIndicator, SafeAreaView, Alert, RefreshControl
 } from 'react-native';
 import { useFonts, Montserrat_700Bold, Montserrat_600SemiBold, Montserrat_400Regular } from '@expo-google-fonts/montserrat';
-import {
-    ArrowLeft, Calendar, Clock, Users, DollarSign, Info,
-    CheckCircle, AlertCircle
-} from 'lucide-react-native';
-import { router, Stack, useLocalSearchParams } from 'expo-router';
-import { format, differenceInHours, parseISO, isValid } from 'date-fns';
+import { Calendar, Clock, Users, ChevronLeft, ChevronRight, AlertCircle } from 'lucide-react-native';
+import { router, useLocalSearchParams, Stack } from 'expo-router';
+import Animated, { FadeIn } from 'react-native-reanimated';
+import { format, addDays, isSameDay, isBefore, startOfDay, endOfDay, parseISO, isValid } from 'date-fns';
 import { fr } from 'date-fns/locale';
 import { supabase } from '@/lib/supabase';
-import { useAuth } from '@/hooks/useAuth';
 
-// Interface PoolData MISE À JOUR
 interface BookingPoolData {
     title: string;
-    location: string | null;
-    price_per_hour: number;
     capacity: number | null;
-    owner_id: string; // <-- ID de l'hôte propriétaire
+    available_time_slots: string[] | null;
+    price_per_hour: number | null;
+    location?: string | null;
+    owner_id?: string;
 }
 
-export default function BookingConfirmScreen() {
-    const params = useLocalSearchParams();
+// Helper pour parser et formater les créneaux
+const parseTimeSlot = (slot: string): { start: { hour: number, minute: number }, end: { hour: number, minute: number } } | null => {
+    const match = slot.match(/(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})/);
+    if (!match) return null;
+    return {
+        start: { hour: parseInt(match[1], 10), minute: parseInt(match[2], 10) },
+        end: { hour: parseInt(match[3], 10), minute: parseInt(match[4], 10) }
+    };
+};
 
-    // Params formatés (assurer que ce sont des strings)
-    const poolId = params.poolId as string ?? '';
-    const startTimeStr = params.startTime as string ?? '';
-    const endTimeStr = params.endTime as string ?? '';
-    const guestCountStr = params.guestCount as string ?? '1';
+const formatBookingToSlotString = (bookingStartTime: Date, bookingEndTime: Date): string => {
+    return `${format(bookingStartTime, 'HH:mm')} - ${format(bookingEndTime, 'HH:mm')}`;
+};
 
-    // États locaux
-    const { user, isVerified, isLoading: isLoadingAuth } = useAuth();
+export default function BookingScreen() {
+    // Paramètres et états principaux
+    const params = useLocalSearchParams<{ poolId: string }>();
+    const poolId = useMemo(() => params.poolId as string, [params.poolId]);
+    
+    const [selectedDate, setSelectedDate] = useState(() => startOfDay(new Date()));
+    const [selectedTimeSlot, setSelectedTimeSlot] = useState<string | null>(null);
+    const [guestCount, setGuestCount] = useState(1);
+    
+    // États de données
     const [poolData, setPoolData] = useState<BookingPoolData | null>(null);
-    const [loadingPool, setLoadingPool] = useState(true);
+    const [isLoadingPool, setIsLoadingPool] = useState(true);
     const [fetchPoolError, setFetchPoolError] = useState<string | null>(null);
-    const [isProcessing, setIsProcessing] = useState(false);
-    const [bookingError, setBookingError] = useState<string | null>(null);
-
-    // Convertir les paramètres en Dates (plus robuste)
-    const startTime = useMemo(() => {
-        try { return startTimeStr ? parseISO(startTimeStr) : null; } catch { return null; }
-    }, [startTimeStr]);
-    const endTime = useMemo(() => {
-        try { return endTimeStr ? parseISO(endTimeStr) : null; } catch { return null; }
-    }, [endTimeStr]);
-    const guestCount = useMemo(() => parseInt(guestCountStr, 10), [guestCountStr]);
-
-    // Charger les polices
+    const [bookedSlots, setBookedSlots] = useState<Set<string>>(new Set());
+    const [loadingAvailability, setLoadingAvailability] = useState(false);
+    const [availabilityError, setAvailabilityError] = useState<string | null>(null);
+    const [refreshing, setRefreshing] = useState(false);
+    
+    // Références pour éviter les appels multiples
+    const isMounted = useRef(true);
+    const initialLoadDone = useRef(false);
+    const initialAvailabilityCheck = useRef(false);
+    const dataFetchInProgress = useRef(false);
+    const availabilityCheckInProgress = useRef(false);
+    
+    // Polices
     const [fontsLoaded, fontError] = useFonts({
         'Montserrat-Bold': Montserrat_700Bold,
         'Montserrat-SemiBold': Montserrat_600SemiBold,
         'Montserrat-Regular': Montserrat_400Regular,
     });
-
-    // --- Fetch données depuis la table 'pools' ---
-    const fetchPoolData = useCallback(async () => {
-        if (!poolId) { setFetchPoolError("ID de piscine manquant."); setLoadingPool(false); return; }
-        setLoadingPool(true); setFetchPoolError(null);
-        console.log(`🚀 Fetching pool data for ID: ${poolId} from 'pools' table.`);
+    
+    // Effet pour suivre le montage/démontage du composant
+    useEffect(() => {
+        isMounted.current = true;
+        return () => {
+            isMounted.current = false;
+        };
+    }, []);
+    
+    // Chargement des données de la piscine
+    const loadPoolData = useCallback(async (isRefresh = false) => {
+        if (dataFetchInProgress.current && !isRefresh) return;
+        if (!poolId) {
+            if (isMounted.current) {
+                setFetchPoolError("ID piscine manquant.");
+                setIsLoadingPool(false);
+            }
+            return;
+        }
+        
+        if (!isRefresh && isMounted.current) setIsLoadingPool(true);
+        if (isMounted.current) setFetchPoolError(null);
+        dataFetchInProgress.current = true;
+        
         try {
+            console.log(`🚀 Chargement des données de la piscine ID: ${poolId}`);
+            
             const { data, error } = await supabase
-    .from('pool_listings') // Remplacer 'pools' par 'pool_listings'
-                .select('title, location, price_per_hour, capacity, owner_id')
+                .from('pool_listings')
+                .select('title, capacity, available_time_slots, price_per_hour, location, owner_id')
                 .eq('id', poolId)
                 .single();
 
             if (error) {
-                 if (error.code === 'PGRST116') { throw new Error("Piscine introuvable."); }
-                 throw error;
+                if (error.code === 'PGRST116') {
+                    throw new Error("Piscine introuvable.");
+                }
+                throw error;
             }
-            if (!data || !data.owner_id) throw new Error("Données piscine invalides ou propriétaire manquant.");
-
-            console.log("✅ Pool data received:", data);
-            setPoolData(data as BookingPoolData);
+            
+            if (!data) throw new Error("Données de la piscine non trouvées.");
+            
+            const formattedData = {
+                ...data,
+                available_time_slots: data.available_time_slots === null ? [] : data.available_time_slots
+            };
+            
+            if (isMounted.current) {
+                setPoolData(formattedData as BookingPoolData);
+            }
         } catch (err: any) {
-            console.error("Error in fetchPoolData:", err);
-            setFetchPoolError(err.message || "Erreur chargement données piscine.");
-            setPoolData(null);
+            console.error("Erreur chargement données piscine:", err);
+            if (isMounted.current) {
+                setFetchPoolError(err.message || "Erreur chargement piscine.");
+                setPoolData(null);
+            }
         } finally {
-            setLoadingPool(false);
+            if (!isRefresh && isMounted.current) setIsLoadingPool(false);
+            dataFetchInProgress.current = false;
+            initialLoadDone.current = true;
         }
     }, [poolId]);
-
-    useEffect(() => { fetchPoolData(); }, [fetchPoolData]);
-
-    // Calcul du prix total (CORRIGÉ : inclut guestCount)
-    const pricing = useMemo(() => {
-        if (!poolData || !startTime || !endTime || !isValid(startTime) || !isValid(endTime) || isNaN(guestCount) || guestCount < 1) {
-            return { hours: 0, basePrice: 0, totalPrice: 0, pricePerGuestPerHour: 0 };
-        }
-        const hours = differenceInHours(endTime, startTime);
-        if (hours <= 0) return { hours: 0, basePrice: 0, totalPrice: 0, pricePerGuestPerHour: 0 };
-        const pricePerGuestPerHour = poolData.price_per_hour ?? 0;
-        const totalPrice = hours * pricePerGuestPerHour * guestCount;
-        return { hours, basePrice: pricePerGuestPerHour * hours, totalPrice, pricePerGuestPerHour };
-    }, [poolData, startTime, endTime, guestCount]);
-
-    // --- Fonction de Confirmation (Ajout insertion participants) ---
-    const handleConfirmBooking = async () => {
-        // Vérifications initiales
-        if (!user) { Alert.alert("Erreur", "Connectez-vous pour réserver."); return; }
-        if (!isVerified) { Alert.alert("Vérification requise", "Vérifiez votre identité avant de réserver."); router.push('/profile/verify'); return; }
-        if (!poolData || !poolId || !startTime || !endTime || !guestCount || isNaN(guestCount) || !isValid(startTime) || !isValid(endTime) || !poolData.owner_id || fetchPoolError) { Alert.alert("Erreur", `Impossible de continuer : ${fetchPoolError || 'Informations manquantes/invalides.'}`); return; }
-        if (poolData.capacity && guestCount > poolData.capacity) { Alert.alert("Capacité dépassée", `Max ${poolData.capacity} personnes.`); return; }
-        if (pricing.hours <= 0) { Alert.alert("Erreur", "Durée de réservation invalide."); return; }
-
-        // !!! Ajouter la vérification dynamique de disponibilité ici !!!
-// Vérifier que le créneau est toujours disponible avant de créer la réservation
-console.log("Dernière vérification de disponibilité pour le créneau...");
-try {
-    const { data: conflictingBookings, error: checkError } = await supabase
-        .from('bookings')
-        .select('id')
-        .eq('listing_id', poolId)
-        .not('status', 'in', '("canceled", "declined")')  // Exclure les réservations annulées/refusées
-        .lt('start_time', endTime.toISOString())
-        .gt('end_time', startTime.toISOString());
-
-    if (checkError) throw new Error("Erreur lors de la vérification de disponibilité");
     
-    if (conflictingBookings && conflictingBookings.length > 0) {
-        setBookingError("Ce créneau n'est plus disponible. Veuillez choisir un autre horaire.");
-        Alert.alert("Créneau indisponible", "Ce créneau a été réservé entre temps. Veuillez choisir un autre horaire.");
-        return;
-    }
-    console.log("Créneau toujours disponible, poursuite de la réservation...");
-} catch (err) {
-    console.error("Erreur lors de la vérification finale de disponibilité:", err);
-    setBookingError("Impossible de vérifier la disponibilité. Veuillez réessayer.");
-    return;
-}
-      
-        setIsProcessing(true); setBookingError(null);
-        console.log("Attempting to insert booking as PENDING...");
+    // Vérification des disponibilités
+    const checkAvailability = useCallback(async (dateToCheck: Date) => {
+        if (!poolId || !dateToCheck) return;
+        
+        if (availabilityCheckInProgress.current) return;
+        availabilityCheckInProgress.current = true;
+        
+        if (isMounted.current) {
+            setLoadingAvailability(true);
+            setAvailabilityError(null);
+        }
+        
+        const formattedDate = format(dateToCheck, 'yyyy-MM-dd');
+        console.log(`⏳ Vérification disponibilité pour ${poolId} le ${formattedDate}`);
 
-        const bookingData = {
-            // Correction: S'assurer que poolId correspond à la colonne FK dans bookings
-            // Si la FK dans 'bookings' pointe vers 'pool_listings', il faut utiliser l'ID de pool_listings
-            // Si 'pools' et 'pool_listings' partagent le même ID, c'est bon. Sinon, ajuster ici.
-    listing_id: poolId, // Utiliser listing_id au lieu de pool_id
-            user_id: user.id,
-            start_time: startTime.toISOString(),
-            end_time: endTime.toISOString(),
-            guest_count: guestCount,
-            total_price: pricing.totalPrice,
-            status: 'pending'
-        };
-
-        let insertedBookingId: string | null = null;
-        let insertedConversationId: string | null = null;
+        const dayStart = startOfDay(dateToCheck).toISOString();
+        const dayEnd = endOfDay(dateToCheck).toISOString();
 
         try {
-            // 1. Insérer la réservation
-            const { data: insertedBooking, error: insertBookingError } = await supabase
+            const { data: conflictingBookings, error } = await supabase
                 .from('bookings')
-                .insert(bookingData)
-                .select('id') // Sélectionner l'ID de la réservation insérée
-                .single();
+                .select('start_time, end_time')
+                .eq('listing_id', poolId)
+                .in('status', ['confirmed', 'pending'])
+                .lt('start_time', dayEnd)
+                .gt('end_time', dayStart);
 
-            if (insertBookingError) throw insertBookingError;
-            if (!insertedBooking?.id) throw new Error("ID réservation manquant après insertion.");
-            insertedBookingId = insertedBooking.id; // Stocker l'ID
-            console.log("✅ Booking successfully inserted! ID:", insertedBookingId);
+            if (error) throw error;
 
-            // 2. Créer la conversation associée
-            console.log(`Attempting to create conversation for booking ${insertedBookingId}...`);
-            const conversationData = {
-                booking_id: insertedBookingId,
-                swimmer_id: user.id,
-                host_id: poolData.owner_id,
-                status: 'locked' // Statut initial
-            };
-            // ** Modifier pour récupérer l'ID de la conversation **
-            const { data: insertedConversation, error: insertConvError } = await supabase
-                .from('conversations')
-                .insert(conversationData)
-                .select('id') // Sélectionner l'ID de la conversation insérée
-                .single();
-
-            if (insertConvError) {
-                // Log l'erreur mais continuer pour ne pas bloquer la réservation
-                console.warn(`Could not create conversation for booking ${insertedBookingId}:`, insertConvError);
-                // Vous pourriez vouloir annuler la réservation ici si la conversation est essentielle
-                // await supabase.from('bookings').delete().eq('id', insertedBookingId);
-                // throw new Error("Impossible de créer la conversation associée.");
-            } else if (insertedConversation?.id) {
-                insertedConversationId = insertedConversation.id; // Stocker l'ID
-                console.log(`✅ Conversation created! ID: ${insertedConversationId}`);
-
-                // 3. *** AJOUT : Insérer les participants ***
-                console.log(`Attempting to insert participants for conversation ${insertedConversationId}...`);
-                const participantsData = [
-                    { conversation_id: insertedConversationId, user_id: user.id }, // Nageur (utilisateur actuel)
-                    { conversation_id: insertedConversationId, user_id: poolData.owner_id } // Hôte
-                ];
-                const { error: insertParticipantsError } = await supabase
-                    .from('conversation_participants')
-                    .insert(participantsData);
-
-                if (insertParticipantsError) {
-                    // Log l'erreur mais ne pas bloquer la redirection (pour l'instant)
-                    // Peut indiquer un problème si RLS empêche l'insertion ou si les user_id sont invalides
-                    console.warn(`Could not insert participants for conversation ${insertedConversationId}:`, insertParticipantsError);
-                    // Vous pourriez vouloir annuler la réservation/conversation ici
-                } else {
-                    console.log(`✅ Participants inserted for conversation ${insertedConversationId}`);
-                }
-            } else {
-                 // Ce cas est étrange : l'insertion a réussi mais n'a pas retourné d'ID
-                 console.warn(`Conversation was inserted for booking ${insertedBookingId}, but failed to retrieve its ID.`);
-                 // Continuer quand même ? Ou considérer comme une erreur ?
+            const currentlyBookedSlots = new Set<string>();
+            
+            if (conflictingBookings && conflictingBookings.length > 0) {
+                conflictingBookings.forEach(booking => {
+                    try {
+                        const start = parseISO(booking.start_time);
+                        const end = parseISO(booking.end_time);
+                        if (isValid(start) && isValid(end) && isSameDay(start, dateToCheck)) {
+                            const slotString = formatBookingToSlotString(start, end);
+                            currentlyBookedSlots.add(slotString);
+                        }
+                    } catch (parseError) { 
+                        console.error("Erreur de parsing des dates:", parseError); 
+                    }
+                });
             }
-
-            // 4. Rediriger vers la page de succès
-            router.replace({ pathname: '/booking/success', params: { bookingId: insertedBookingId, status: 'pending' } });
-
+            
+            console.log(`✅ ${currentlyBookedSlots.size} créneaux réservés pour le ${formattedDate}`);
+            
+            if (isMounted.current) {
+                setBookedSlots(currentlyBookedSlots);
+            }
+            
         } catch (err: any) {
-            console.error("Error creating booking, conversation, or participants:", err);
-            setBookingError(err.message || "Erreur lors de la création.");
-            Alert.alert("Erreur", `Impossible de créer la réservation: ${err.message || "Erreur inconnue"}`);
-            // En cas d'erreur, supprimer la réservation si elle a été créée mais pas la conversation/participants ?
-            if (insertedBookingId && !insertedConversationId) {
-                console.log(`Attempting to delete booking ${insertedBookingId} due to subsequent error...`);
-                await supabase.from('bookings').delete().eq('id', insertedBookingId);
+            console.error("Erreur vérification disponibilité:", err);
+            if (isMounted.current) {
+                setAvailabilityError("Erreur vérification disponibilité.");
             }
         } finally {
-            setIsProcessing(false);
+            if (isMounted.current) {
+                setLoadingAvailability(false);
+            }
+            initialAvailabilityCheck.current = true;
+            availabilityCheckInProgress.current = false;
         }
-    };
+    }, [poolId]);
+    
+    // Effet de chargement initial
+    useEffect(() => {
+        if (!poolId || !fontsLoaded || fontError) return;
+        
+        if (initialLoadDone.current) return;
+        
+        console.log("[BookingScreen] Chargement initial des données");
+        loadPoolData();
+        
+    }, [poolId, fontsLoaded, fontError, loadPoolData]);
+    
+    // Effet pour la disponibilité
+    useEffect(() => {
+        if (!poolId || !poolData || isLoadingPool) return;
+        
+        if (availabilityCheckInProgress.current) return;
+        
+        if (!initialAvailabilityCheck.current || selectedDate) {
+            console.log(`[BookingScreen] Vérification disponibilité pour le ${format(selectedDate, 'yyyy-MM-dd')}`);
+            
+            let isEffectActive = true;
+            
+            const checkDateAvailability = async () => {
+                await checkAvailability(selectedDate);
+                if (!isEffectActive) return;
+            };
+            
+            checkDateAvailability();
+            
+            return () => {
+                isEffectActive = false; 
+            };
+        }
+    }, [selectedDate, poolId, poolData, isLoadingPool, checkAvailability]);
+    
+    // Valeurs dérivées
+    const availableSlots = useMemo(() => {
+        return Array.isArray(poolData?.available_time_slots) 
+            ? [...poolData.available_time_slots].sort() 
+            : [];
+    }, [poolData?.available_time_slots]);
+    
+    const maxCapacity = useMemo(() => 
+        poolData?.capacity || 1, 
+    [poolData?.capacity]);
 
-    // --- Rendu ---
-     if (!fontsLoaded || fontError) { return <SafeAreaView style={styles.loadingContainer}><ActivityIndicator /></SafeAreaView>; }
-     if (loadingPool || isLoadingAuth) { return <SafeAreaView style={styles.loadingContainer}><ActivityIndicator size="large" color="#0891b2" /><Text style={styles.loadingText}>Chargement...</Text></SafeAreaView>; }
-     if (!isLoadingAuth && !user) { router.replace('/(auth)/sign-in'); return null; }
+    // Ajuster le nombre d'invités
+    useEffect(() => {
+        if (poolData && guestCount > maxCapacity && isMounted.current) {
+            setGuestCount(maxCapacity);
+        }
+    }, [maxCapacity, poolData, guestCount]);
+
+    // Gestionnaires d'événements
+    const handleDateChange = useCallback((days: number) => {
+        const newDate = addDays(selectedDate, days);
+        if (isBefore(newDate, startOfDay(new Date()))) return;
+        setSelectedDate(newDate);
+        setSelectedTimeSlot(null);
+    }, [selectedDate]);
+
+    const handleGuestChange = useCallback((increment: boolean) => {
+        if (!isMounted.current) return;
+        setGuestCount(prev => {
+            const newValue = increment ? prev + 1 : prev - 1;
+            return (newValue >= 1 && newValue <= maxCapacity) ? newValue : prev;
+        });
+    }, [maxCapacity]);
+
+    const handleContinue = useCallback(() => {
+        if (!selectedTimeSlot) {
+            Alert.alert("Information manquante", "Veuillez sélectionner un créneau horaire.");
+            return;
+        }
+        
+        if (bookedSlots.has(selectedTimeSlot)) {
+            Alert.alert("Créneau Indisponible", "Ce créneau n'est plus disponible. Veuillez en choisir un autre.");
+            return;
+        }
+
+        if (!poolData || !poolId || !selectedDate || !guestCount) {
+            Alert.alert("Erreur", "Informations manquantes pour continuer.");
+            return;
+        }
+
+        const slotTimes = parseTimeSlot(selectedTimeSlot);
+        if (!slotTimes) {
+            Alert.alert("Erreur", "Format de créneau invalide.");
+            return;
+        }
+        
+        const startTime = new Date(selectedDate);
+        startTime.setHours(slotTimes.start.hour, slotTimes.start.minute, 0, 0);
+        
+        const endTime = new Date(selectedDate);
+        endTime.setHours(slotTimes.end.hour, slotTimes.end.minute, 0, 0);
+
+        // Vérifier si l'heure de début n'est pas dans le passé
+        if (isBefore(startTime, new Date())) {
+            Alert.alert("Créneau Passé", "Vous ne pouvez pas réserver un créneau horaire déjà passé.");
+            return;
+        }
+
+        // **CORRECTION PRINCIPALE** : Utiliser listingId au lieu de poolId pour correspondre à confirm.tsx
+        router.push({
+            pathname: '/booking/confirm',
+            params: {
+                poolId: poolId,       // Garder poolId pour correspondre aux autres screens
+                startTime: startTime.toISOString(),
+                endTime: endTime.toISOString(),
+                guestCount: guestCount.toString()
+            }
+        });
+    }, [poolId, poolData, selectedDate, selectedTimeSlot, guestCount, bookedSlots, router]);
+
+    // Valeurs dérivées pour le formatage
+    const isDateToday = useMemo(() => 
+        isSameDay(selectedDate, new Date()), 
+        [selectedDate]
+    );
+    
+    const formatDateHeader = useCallback((date: Date) => 
+        isDateToday ? "Aujourd'hui" : format(date, 'EEEE d MMMM', { locale: fr }),
+        [isDateToday]
+    );
+
+    // Gestionnaire d'actualisation manuelle
+    const onRefresh = useCallback(async () => {
+        if (!isMounted.current) return;
+        setRefreshing(true);
+        
+        try {
+            await loadPoolData(true);
+            if (!availabilityCheckInProgress.current) {
+                await checkAvailability(selectedDate);
+            }
+        } finally {
+            if (isMounted.current) {
+                setRefreshing(false);
+            }
+        }
+    }, [loadPoolData, checkAvailability, selectedDate]);
+
+    // Rendu
+    if (!fontsLoaded || fontError) {
+        return (
+            <SafeAreaView style={styles.loadingContainer}>
+                <ActivityIndicator />
+            </SafeAreaView>
+        );
+    }
+    
+    if (isLoadingPool) {
+        return (
+            <SafeAreaView style={styles.loadingContainer}>
+                <ActivityIndicator size="large" color="#0891b2" />
+            </SafeAreaView>
+        );
+    }
+    
+    if (fetchPoolError) {
+        return (
+            <SafeAreaView style={styles.errorContainer}>
+                <Text style={styles.errorText}>{fetchPoolError}</Text>
+            </SafeAreaView>
+        );
+    }
+    
+    if (!poolData) {
+        return (
+            <SafeAreaView style={styles.errorContainer}>
+                <Text style={styles.errorText}>Piscine introuvable.</Text>
+            </SafeAreaView>
+        );
+    }
 
     return (
         <SafeAreaView style={styles.container}>
-            <Stack.Screen options={{ headerShown: false }} />
+            <Stack.Screen options={{ title: poolData.title || 'Réservation', headerBackTitle: 'Retour' }} />
+            <ScrollView
+                style={styles.content}
+                refreshControl={
+                    <RefreshControl 
+                        refreshing={refreshing} 
+                        onRefresh={onRefresh} 
+                        tintColor="#0891b2"
+                    />
+                }
+            >
+                {/* Section Date */}
+                <Animated.View style={styles.dateSection} entering={FadeIn.delay(200).springify()}>
+                     <Text style={styles.sectionTitle}>Date</Text>
+                     <View style={styles.dateNavigation}>
+                         <TouchableOpacity 
+                             style={[styles.navigationButton, isDateToday && styles.navigationButtonDisabled]} 
+                             onPress={() => handleDateChange(-1)} 
+                             disabled={isDateToday}
+                         >
+                             <ChevronLeft size={24} color={isDateToday ? '#cbd5e1' : '#1e293b'} />
+                         </TouchableOpacity>
+                         <Text style={styles.dateText}>{formatDateHeader(selectedDate)}</Text>
+                         <TouchableOpacity 
+                             style={styles.navigationButton} 
+                             onPress={() => handleDateChange(1)}
+                         >
+                             <ChevronRight size={24} color="#1e293b" />
+                         </TouchableOpacity>
+                     </View>
+                 </Animated.View>
 
-            {/* Header */}
-            <View style={styles.header}>
-                <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
-                    <ArrowLeft color="#475569" size={22} />
-                </TouchableOpacity>
-                <Text style={styles.headerTitle}>Confirmer la réservation</Text>
-                <View style={{ width: 40 }} />
-            </View>
-
-            <ScrollView style={styles.content}>
-                {/* Erreur Fetch Piscine */}
-                {fetchPoolError && ( <View style={styles.errorCard}><AlertCircle color="#b91c1c" size={24} /><Text style={styles.errorText}>{fetchPoolError}</Text></View> )}
-
-                {/* Détails Piscine */}
-                {poolData && ( <View style={styles.poolCard}><Text style={styles.poolName}>{poolData.title}</Text>{poolData.location && <Text style={styles.poolLocation}>{poolData.location}</Text>}</View> )}
-
-                {/* Détails Réservation */}
-                {startTime && endTime && isValid(startTime) && isValid(endTime) && guestCount && (
-                    <View style={styles.bookingDetailsCard}>
-                        <Text style={styles.sectionTitle}>Détails de la réservation</Text>
-                        <View style={styles.detailRow}><View style={styles.detailIconContainer}><Calendar size={18} color="#475569" /></View><View style={styles.detailContent}><Text style={styles.detailLabel}>Date</Text><Text style={styles.detailValue}>{format(startTime, 'EEEE d MMMM yyyy', { locale: fr })}</Text></View></View>
-                        <View style={styles.detailRow}><View style={styles.detailIconContainer}><Clock size={18} color="#475569" /></View><View style={styles.detailContent}><Text style={styles.detailLabel}>Horaire</Text><Text style={styles.detailValue}>{format(startTime, 'HH:mm')} - {format(endTime, 'HH:mm')} ({pricing.hours}h)</Text></View></View>
-                        <View style={styles.detailRow}><View style={styles.detailIconContainer}><Users size={18} color="#475569" /></View><View style={styles.detailContent}><Text style={styles.detailLabel}>Nombre de personnes</Text><Text style={styles.detailValue}>{guestCount} {guestCount === 1 ? 'personne' : 'personnes'}</Text></View></View>
+                {/* Section Horaire */}
+                <Animated.View style={styles.timeSection} entering={FadeIn.delay(400).springify()}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Text style={styles.sectionTitle}>Horaire</Text>
+                        {loadingAvailability && <ActivityIndicator size="small" color="#0891b2" />}
                     </View>
-                )}
+                    
+                    {availabilityError && (
+                        <Text style={styles.errorTextSmall}>{availabilityError}</Text>
+                    )}
+                    
+                    <View style={styles.timeSlotsGrid}>
+                        {availableSlots.length > 0 ? (
+                            availableSlots.map((slot, index) => {
+                                const isBooked = bookedSlots.has(slot);
+                                const isSelected = selectedTimeSlot === slot;
 
-                {/* Récap Prix */}
-                {poolData && pricing.totalPrice >= 0 && pricing.hours > 0 && (
-                    <View style={styles.pricingCard}>
-                        <Text style={styles.sectionTitle}>Récapitulatif des prix</Text>
-                        <View style={styles.priceRow}>
-                             <Text style={styles.priceLabel}>{pricing.hours}h × {guestCount} {guestCount > 1 ? 'pers.' : 'pers.'} × {pricing.pricePerGuestPerHour} MAD/h/pers.</Text>
-                             <Text style={styles.priceValue}>{pricing.totalPrice} MAD</Text>
-                         </View>
-                        <View style={styles.totalRow}>
-                            <Text style={styles.totalLabel}>Total</Text>
-                            <Text style={styles.totalValue}>{pricing.totalPrice} MAD</Text>
+                                let isPastSlot = false;
+                                const slotTimes = parseTimeSlot(slot);
+                                if (slotTimes && isSameDay(selectedDate, new Date())) {
+                                    const slotStartTime = new Date(selectedDate);
+                                    slotStartTime.setHours(slotTimes.start.hour, slotTimes.start.minute, 0, 0);
+                                    if (isBefore(slotStartTime, new Date())) {
+                                        isPastSlot = true;
+                                    }
+                                }
+                                const isDisabled = isBooked || isPastSlot;
+
+                                return (
+                                    <TouchableOpacity
+                                        key={index}
+                                        style={[
+                                            styles.timeSlot, 
+                                            isSelected && !isDisabled && styles.timeSlotSelected, 
+                                            isDisabled && styles.timeSlotDisabled
+                                        ]}
+                                        onPress={() => { if (!isDisabled) setSelectedTimeSlot(slot); }}
+                                        disabled={isDisabled || loadingAvailability}
+                                        activeOpacity={isDisabled ? 1 : 0.7}
+                                    >
+                                        <Clock 
+                                            size={20} 
+                                            color={isSelected && !isDisabled ? '#ffffff' : isDisabled ? '#9ca3af' : '#0891b2'} 
+                                        />
+                                        <Text style={[
+                                            styles.timeSlotText, 
+                                            isSelected && !isDisabled && styles.timeSlotTextSelected, 
+                                            isDisabled && styles.timeSlotTextDisabled
+                                        ]}>
+                                            {slot} {isBooked ? "(Indisponible)" : isPastSlot ? "(Passé)" : ""}
+                                        </Text>
+                                    </TouchableOpacity>
+                                );
+                            })
+                        ) : (
+                            <View style={styles.noSlotsContainer}>
+                                <AlertCircle size={20} color="#64748b" />
+                                <Text style={styles.noSlotsText}>Aucun créneau défini pour cette piscine.</Text>
+                            </View>
+                        )}
+                    </View>
+                </Animated.View>
+
+                {/* Section Invités */}
+                <Animated.View style={styles.guestsSection} entering={FadeIn.delay(600).springify()}>
+                    <Text style={styles.sectionTitle}>Nombre de personnes (Max: {maxCapacity})</Text>
+                    <View style={styles.guestsControl}>
+                        <TouchableOpacity 
+                            style={[
+                                styles.guestButton, 
+                                guestCount === 1 && styles.guestButtonDisabled
+                            ]} 
+                            onPress={() => handleGuestChange(false)} 
+                            disabled={guestCount === 1}
+                        >
+                            <Text style={[
+                                styles.guestButtonText, 
+                                guestCount === 1 && styles.guestButtonTextDisabled
+                            ]}>-</Text>
+                        </TouchableOpacity>
+                        
+                        <View style={styles.guestCount}>
+                            <Text style={styles.guestCountNumber}>{guestCount}</Text>
+                            <Text style={styles.guestCountLabel}>
+                                {guestCount === 1 ? 'personne' : 'personnes'}
+                            </Text>
                         </View>
+                        
+                        <TouchableOpacity 
+                            style={[
+                                styles.guestButton, 
+                                guestCount === maxCapacity && styles.guestButtonDisabled
+                            ]} 
+                            onPress={() => handleGuestChange(true)} 
+                            disabled={guestCount === maxCapacity}
+                        >
+                            <Text style={[
+                                styles.guestButtonText, 
+                                guestCount === maxCapacity && styles.guestButtonTextDisabled
+                            ]}>+</Text>
+                        </TouchableOpacity>
                     </View>
-                )}
-
-                 {/* Note Statut Pending */}
-                 <View style={styles.infoCard}>
-                     <Info size={20} color="#0891b2" />
-                     <Text style={styles.infoText}>Votre réservation sera <Text style={styles.infoHighlight}>en attente</Text> jusqu'à confirmation par l'hôte.</Text>
-                 </View>
-
-                 {/* Erreur Booking */}
-                 {bookingError && ( <View style={styles.errorCard}><AlertCircle color="#b91c1c" size={24} /><Text style={styles.errorText}>{bookingError}</Text></View> )}
-
-                <View style={{ height: 150 }} />
+                </Animated.View>
+                
+                <View style={{ height: 100 }} />
             </ScrollView>
 
-            {/* Footer (fixe) */}
+            {/* Footer */}
             <View style={styles.footer}>
-                 {/* Message Vérification KYC */}
-                 {!isLoadingAuth && !isVerified && ( <View style={styles.verificationNeededContainer}> <AlertCircle size={20} color="#d97706" /> <View style={styles.verificationNeededTextContainer}><Text style={styles.verificationNeededTitle}>Vérification Requise</Text><Text style={styles.verificationNeededSubtitle}>Vérifiez votre identité pour réserver.</Text></View> <TouchableOpacity style={styles.verifyLinkButton} onPress={() => router.push('/profile/verify')}><Text style={styles.verifyLinkButtonText}>Vérifier</Text></TouchableOpacity> </View> )}
-                 {/* Bouton Confirmer */}
-                 <TouchableOpacity
-                     style={[ styles.confirmButton, (isProcessing || loadingPool || !poolData || !!fetchPoolError || !isVerified || isLoadingAuth || pricing.hours <= 0) && styles.disabledButton ]}
-                     onPress={handleConfirmBooking}
-                     disabled={isProcessing || loadingPool || !poolData || !!fetchPoolError || !isVerified || isLoadingAuth || pricing.hours <= 0}
-                 >
-                  {isProcessing ? ( <ActivityIndicator color="#ffffff" size="small" /> ) : ( <> <CheckCircle size={20} color="#ffffff" /> <Text style={styles.confirmButtonText}>Demander à réserver ({pricing.totalPrice} MAD)</Text> </> )}
-                 </TouchableOpacity>
+                <TouchableOpacity
+                    style={[
+                        styles.continueButton, 
+                        (!selectedTimeSlot || loadingAvailability || bookedSlots.has(selectedTimeSlot ?? '')) && styles.continueButtonDisabled
+                    ]}
+                    onPress={handleContinue}
+                    disabled={!selectedTimeSlot || loadingAvailability || bookedSlots.has(selectedTimeSlot ?? '')}
+                >
+                    <Text style={styles.continueButtonText}>
+                        {selectedTimeSlot && bookedSlots.has(selectedTimeSlot)
+                            ? 'Créneau Indisponible'
+                            : selectedTimeSlot
+                            ? 'Continuer vers Confirmation'
+                            : 'Sélectionnez un créneau'
+                        }
+                    </Text>
+                </TouchableOpacity>
             </View>
         </SafeAreaView>
     );
 }
 
-// --- Styles ---
+// Styles
 const styles = StyleSheet.create({
-     container: { flex: 1, backgroundColor: '#f8fafc' },
-     loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f8fafc' },
-     loadingText: { marginTop: 12, fontFamily: 'Montserrat-Regular', fontSize: 16, color: '#64748b' },
-     header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: Platform.OS === 'ios' ? 10 : 40, paddingBottom: 10, backgroundColor: '#ffffff', borderBottomWidth: 1, borderBottomColor: '#e5e7eb' },
-     backButton: { padding: 8 },
-     headerTitle: { fontFamily: 'Montserrat-SemiBold', fontSize: 18, color: '#1e293b' },
-     content: { flex: 1, paddingHorizontal: 16, paddingTop: 16 },
-     errorCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fef2f2', padding: 16, borderRadius: 12, marginBottom: 16, gap: 12, borderWidth: 1, borderColor: '#fecaca' },
-     errorText: { fontFamily: 'Montserrat-Regular', fontSize: 14, color: '#b91c1c', flex: 1 },
-     poolCard: { backgroundColor: '#ffffff', padding: 16, borderRadius: 12, marginBottom: 16, borderWidth: 1, borderColor: '#e5e7eb' },
-     poolName: { fontFamily: 'Montserrat-Bold', fontSize: 18, color: '#1e293b', marginBottom: 4 },
-     poolLocation: { fontFamily: 'Montserrat-Regular', fontSize: 14, color: '#64748b' },
-     bookingDetailsCard: { backgroundColor: '#ffffff', padding: 16, borderRadius: 12, marginBottom: 16, borderWidth: 1, borderColor: '#e5e7eb' },
-     sectionTitle: { fontFamily: 'Montserrat-Bold', fontSize: 16, color: '#1e293b', marginBottom: 16 },
-     detailRow: { flexDirection: 'row', marginBottom: 12, alignItems: 'flex-start' },
-     detailIconContainer: { width: 32, height: 32, borderRadius: 16, backgroundColor: '#f1f5f9', justifyContent: 'center', alignItems: 'center', marginRight: 12, marginTop: 2 },
-     detailContent: { flex: 1, justifyContent: 'center' },
-     detailLabel: { fontFamily: 'Montserrat-Regular', fontSize: 12, color: '#64748b', marginBottom: 2 },
-     detailValue: { fontFamily: 'Montserrat-SemiBold', fontSize: 15, color: '#1e293b', lineHeight: 20 },
-     pricingCard: { backgroundColor: '#ffffff', padding: 16, borderRadius: 12, marginBottom: 16, borderWidth: 1, borderColor: '#e5e7eb' },
-     priceRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
-     priceLabel: { fontFamily: 'Montserrat-Regular', fontSize: 14, color: '#475569', flexShrink: 1, marginRight: 8 },
-     priceValue: { fontFamily: 'Montserrat-SemiBold', fontSize: 14, color: '#475569' },
-     totalRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: '#e5e7eb' },
-     totalLabel: { fontFamily: 'Montserrat-Bold', fontSize: 16, color: '#1e293b' },
-     totalValue: { fontFamily: 'Montserrat-Bold', fontSize: 16, color: '#0891b2' },
-     infoCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#f0f9ff', padding: 16, borderRadius: 12, marginBottom: 16, gap: 12, borderWidth: 1, borderColor: '#bae6fd' },
-     infoText: { fontFamily: 'Montserrat-Regular', fontSize: 14, color: '#0c4a6e', flex: 1, lineHeight: 20 },
-     infoHighlight: { fontFamily: 'Montserrat-SemiBold' },
-     footer: { padding: 16, paddingBottom: Platform.OS === 'ios' ? 34 : 16, backgroundColor: '#ffffff', borderTopWidth: 1, borderTopColor: '#e5e7eb' },
-     verificationNeededContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fffbeb', padding: 12, borderRadius: 8, marginBottom: 16, borderWidth: 1, borderColor: '#fef3c7', gap: 10, },
-     verificationNeededTextContainer: { flex: 1, },
-     verificationNeededTitle: { fontFamily: 'Montserrat-SemiBold', fontSize: 14, color: '#b45309', },
-     verificationNeededSubtitle: { fontFamily: 'Montserrat-Regular', fontSize: 13, color: '#ca8a04', marginTop: 2, },
-     verifyLinkButton: { paddingHorizontal: 12, paddingVertical: 6, backgroundColor: '#f59e0b', borderRadius: 6, },
-     verifyLinkButtonText: { fontFamily: 'Montserrat-SemiBold', fontSize: 13, color: '#ffffff', },
-     confirmButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0891b2', padding: 16, borderRadius: 12, gap: 10, height: 52 },
-     confirmButtonText: { fontFamily: 'Montserrat-SemiBold', fontSize: 16, color: '#ffffff' },
-     disabledButton: { backgroundColor: '#94a3b8', opacity: 0.7 },
+    loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff' },
+    errorContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20, backgroundColor: '#fff' },
+    errorText: { fontFamily: 'Montserrat-Regular', color: '#dc2626', fontSize: 16, textAlign: 'center' },
+    errorTextSmall: { fontFamily: 'Montserrat-Regular', fontSize: 13, color: '#ef4444', textAlign: 'center', marginBottom: 8 },
+    noSlotsContainer: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 20, opacity: 0.7 },
+    noSlotsText: { fontFamily: 'Montserrat-Regular', fontSize: 15, color: '#64748b' },
+    container: { flex: 1, backgroundColor: '#ffffff' },
+    content: { flex: 1, paddingHorizontal: 16, paddingTop: 16 },
+    dateSection: { marginBottom: 24 },
+    sectionTitle: { fontFamily: 'Montserrat-Bold', fontSize: 18, color: '#1e293b', marginBottom: 12 },
+    dateNavigation: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#f8fafc', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: '#e2e8f0' },
+    navigationButton: { padding: 8 },
+    navigationButtonDisabled: { opacity: 0.4 },
+    dateText: { fontFamily: 'Montserrat-SemiBold', fontSize: 16, color: '#1e293b', textTransform: 'capitalize' },
+    timeSection: { marginBottom: 24 },
+    timeSlotsGrid: { gap: 10 },
+    timeSlot: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#f8fafc', paddingVertical: 12, paddingHorizontal: 16, borderRadius: 10, borderWidth: 1, borderColor: '#e2e8f0' },
+    timeSlotSelected: { backgroundColor: '#0891b2', borderColor: '#06b6d4' },
+    timeSlotDisabled: { backgroundColor: '#f1f5f9', borderColor: '#e2e8f0', opacity: 0.6 },
+    timeSlotText: { fontFamily: 'Montserrat-SemiBold', fontSize: 15, color: '#1e293b' },
+    timeSlotTextSelected: { color: '#ffffff' },
+    timeSlotTextDisabled: { color: '#9ca3af', textDecorationLine: 'line-through' },
+    guestsSection: { marginBottom: 24 },
+    guestsControl: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#f8fafc', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: '#e2e8f0' },
+    guestButton: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#0891b2', justifyContent: 'center', alignItems: 'center' },
+    guestButtonDisabled: { backgroundColor: '#cbd5e1' },
+    guestButtonText: { fontFamily: 'Montserrat-Bold', fontSize: 22, color: '#ffffff', lineHeight: 24 },
+    guestButtonTextDisabled: { color: '#94a3b8' },
+    guestCount: { alignItems: 'center' },
+    guestCountNumber: { fontFamily: 'Montserrat-Bold', fontSize: 22, color: '#1e293b' },
+    guestCountLabel: { fontFamily: 'Montserrat-Regular', fontSize: 13, color: '#64748b' },
+    footer: { padding: 16, backgroundColor: '#ffffff', borderTopWidth: 1, borderTopColor: '#f1f5f9', paddingBottom: Platform.OS === 'ios' ? 34 : 16 },
+    continueButton: { backgroundColor: '#0891b2', paddingVertical: 14, borderRadius: 10, alignItems: 'center', height: 50, justifyContent: 'center' },
+    continueButtonDisabled: { backgroundColor: '#94a3b8', opacity: 0.7 },
+    continueButtonText: { fontFamily: 'Montserrat-SemiBold', fontSize: 16, color: '#ffffff' },
 });
